@@ -1,0 +1,1304 @@
+(() => {
+'use strict';
+
+const WM_R = 6378137;
+const WORLD = 2 * Math.PI * WM_R;
+const TILE_SIZE = 256;
+const DETAIL_RECORD = 10;
+const OVERVIEW_RECORD = 10;
+const MAX_SELECTION = 100000;
+const DETAIL_ZOOM = 13;
+const MAX_AUTO_LOAD = 6;
+const $ = id => document.getElementById(id);
+
+const mapEl = $('map');
+const tilesEl = $('tiles');
+const canvas = $('grid-canvas');
+const ctx = canvas.getContext('2d', { alpha: true });
+const dragBox = $('drag-box');
+
+const BASEMAPS = {
+  osm: {
+    maxZoom: 19,
+    attribution: '© OpenStreetMap contributors',
+    url: (z, x, y) => `https://tile.openstreetmap.org/${z}/${x}/${y}.png`
+  },
+  sat: {
+    maxZoom: 19,
+    attribution: 'Tiles © Esri',
+    url: (z, x, y) => `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`
+  },
+  topo: {
+    maxZoom: 17,
+    attribution: '© OpenStreetMap contributors, SRTM | OpenTopoMap',
+    url: (z, x, y) => `https://tile.opentopomap.org/${z}/${x}/${y}.png`
+  },
+  none: { maxZoom: 20, attribution: 'EITN 100×100 m grid', url: null }
+};
+
+const state = {
+  manifest: null,
+  metaByNum: new Map(),
+  metaById: new Map(),
+  enabled: new Set(),
+  loaded: new Map(),
+  loading: new Map(),
+  overview: null,
+  overviewBins: new Map(),
+  lookupCache: new Map(),
+  tileEls: new Map(),
+  centerX: 0,
+  centerY: 0,
+  zoom: 7,
+  width: 1,
+  height: 1,
+  dpr: 1,
+  opacity: 0.78,
+  basemap: 'osm',
+  tool: 'pan',
+  dragging: false,
+  moved: false,
+  pointerId: null,
+  lastX: 0,
+  lastY: 0,
+  boxStart: null,
+  selection: new Map(),
+  visibleLoadTimer: null,
+  loadQueue: [],
+  activeLoads: 0,
+  csvCollapsed: false
+};
+
+let toastTimer = null;
+let csvDbPromise = null;
+const memoryCsvStore = new Map();
+let csvStorageMode = 'indexeddb';
+
+function formatNumber(value) {
+  return Number(value || 0).toLocaleString('bg-BG');
+}
+
+function formatBytes(value) {
+  const n = Number(value || 0);
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function rgba(hex, alpha) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
+function showToast(message) {
+  const el = $('toast');
+  el.textContent = message;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
+}
+
+function setStatus(el, message, type = '') {
+  el.textContent = message;
+  el.className = `status${type ? ` ${type}` : ''}`;
+}
+
+function setLoading(active, label = 'Зареждане…') {
+  $('loading-label').textContent = label;
+  $('loading-indicator').style.display = active ? 'flex' : 'none';
+}
+
+function mapScale() {
+  return TILE_SIZE * (2 ** state.zoom) / WORLD;
+}
+
+function screenX(x) {
+  return state.width / 2 + (x - state.centerX) * mapScale();
+}
+
+function screenY(y) {
+  return state.height / 2 - (y - state.centerY) * mapScale();
+}
+
+function worldX(px) {
+  return state.centerX + (px - state.width / 2) / mapScale();
+}
+
+function worldY(py) {
+  return state.centerY - (py - state.height / 2) / mapScale();
+}
+
+function wmToLonLat(x, y) {
+  return [x / WM_R * 180 / Math.PI, (2 * Math.atan(Math.exp(y / WM_R)) - Math.PI / 2) * 180 / Math.PI];
+}
+
+function lonLatToWm(lon, lat) {
+  const clamped = Math.max(-85.05112878, Math.min(85.05112878, lat));
+  return [WM_R * lon * Math.PI / 180, WM_R * Math.log(Math.tan(Math.PI / 4 + clamped * Math.PI / 360))];
+}
+
+// BGS2005 UTM zone 35N. GRS80 ellipsoid, central meridian 27°.
+const UTM = (() => {
+  const a = 6378137.0;
+  const f = 1 / 298.257222101;
+  const e2 = f * (2 - f);
+  const ep2 = e2 / (1 - e2);
+  const k0 = 0.9996;
+  const lon0 = 27 * Math.PI / 180;
+  const e1 = (1 - Math.sqrt(1 - e2)) / (1 + Math.sqrt(1 - e2));
+  const m1 = 1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256;
+  const m2 = 3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024;
+  const m3 = 15 * e2 ** 2 / 256 + 45 * e2 ** 3 / 1024;
+  const m4 = 35 * e2 ** 3 / 3072;
+
+  function lonLatToUtm(lonDeg, latDeg) {
+    const lat = latDeg * Math.PI / 180;
+    const lon = lonDeg * Math.PI / 180;
+    const sin = Math.sin(lat), cos = Math.cos(lat), tan = Math.tan(lat);
+    const N = a / Math.sqrt(1 - e2 * sin * sin);
+    const T = tan * tan;
+    const C = ep2 * cos * cos;
+    const A = cos * (lon - lon0);
+    const M = a * (m1 * lat - m2 * Math.sin(2 * lat) + m3 * Math.sin(4 * lat) - m4 * Math.sin(6 * lat));
+    const x = 500000 + k0 * N * (A + (1 - T + C) * A ** 3 / 6 + (5 - 18 * T + T * T + 72 * C - 58 * ep2) * A ** 5 / 120);
+    const y = k0 * (M + N * tan * (A * A / 2 + (5 - T + 9 * C + 4 * C * C) * A ** 4 / 24 + (61 - 58 * T + T * T + 600 * C - 330 * ep2) * A ** 6 / 720));
+    return [x, y];
+  }
+
+  function utmToLonLat(x, y) {
+    const M = y / k0;
+    const mu = M / (a * m1);
+    const J1 = 3 * e1 / 2 - 27 * e1 ** 3 / 32;
+    const J2 = 21 * e1 ** 2 / 16 - 55 * e1 ** 4 / 32;
+    const J3 = 151 * e1 ** 3 / 96;
+    const J4 = 1097 * e1 ** 4 / 512;
+    const fp = mu + J1 * Math.sin(2 * mu) + J2 * Math.sin(4 * mu) + J3 * Math.sin(6 * mu) + J4 * Math.sin(8 * mu);
+    const sin = Math.sin(fp), cos = Math.cos(fp), tan = Math.tan(fp);
+    const C1 = ep2 * cos * cos;
+    const T1 = tan * tan;
+    const N1 = a / Math.sqrt(1 - e2 * sin * sin);
+    const R1 = a * (1 - e2) / ((1 - e2 * sin * sin) ** 1.5);
+    const D = (x - 500000) / (N1 * k0);
+    const lat = fp - (N1 * tan / R1) * (D * D / 2 - (5 + 3 * T1 + 10 * C1 - 4 * C1 * C1 - 9 * ep2) * D ** 4 / 24 + (61 + 90 * T1 + 298 * C1 + 45 * T1 * T1 - 252 * ep2 - 3 * C1 * C1) * D ** 6 / 720);
+    const lon = lon0 + (D - (1 + 2 * T1 + C1) * D ** 3 / 6 + (5 - 2 * C1 + 28 * T1 - 3 * C1 * C1 + 8 * ep2 + 24 * T1 * T1) * D ** 5 / 120) / cos;
+    return [lon * 180 / Math.PI, lat * 180 / Math.PI];
+  }
+
+  function wmToUtm(x, y) {
+    const [lon, lat] = wmToLonLat(x, y);
+    return lonLatToUtm(lon, lat);
+  }
+
+  function utmToWm(x, y) {
+    const [lon, lat] = utmToLonLat(x, y);
+    return lonLatToWm(lon, lat);
+  }
+
+  return { lonLatToUtm, utmToLonLat, wmToUtm, utmToWm };
+})();
+
+function fitBounds(bounds, padding = 95, maxZoom = 18) {
+  if (!bounds) return;
+  const dx = Math.max(1, bounds[2] - bounds[0]);
+  const dy = Math.max(1, bounds[3] - bounds[1]);
+  const zx = Math.log2(Math.max(1, (state.width - padding) * WORLD / (TILE_SIZE * dx)));
+  const zy = Math.log2(Math.max(1, (state.height - padding) * WORLD / (TILE_SIZE * dy)));
+  state.zoom = Math.max(5, Math.min(maxZoom, Math.floor(Math.min(zx, zy))));
+  state.centerX = (bounds[0] + bounds[2]) / 2;
+  state.centerY = (bounds[1] + bounds[3]) / 2;
+  render();
+}
+
+function resize() {
+  state.dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  state.width = mapEl.clientWidth;
+  state.height = mapEl.clientHeight;
+  canvas.width = Math.round(state.width * state.dpr);
+  canvas.height = Math.round(state.height * state.dpr);
+  canvas.style.width = `${state.width}px`;
+  canvas.style.height = `${state.height}px`;
+  ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
+  render();
+}
+
+function tileXY(x, y, z) {
+  const n = 2 ** z;
+  return [(x + Math.PI * WM_R) / WORLD * n, (Math.PI * WM_R - y) / WORLD * n];
+}
+
+function renderTiles() {
+  const base = BASEMAPS[state.basemap];
+  $('attribution').textContent = base.attribution;
+  tilesEl.style.background = state.basemap === 'none' ? '#edf2f5' : '#dfe7ec';
+  if (!base.url) {
+    for (const el of state.tileEls.values()) el.remove();
+    state.tileEls.clear();
+    return;
+  }
+  const z = Math.min(state.zoom, base.maxZoom);
+  const n = 2 ** z;
+  const [cx, cy] = tileXY(state.centerX, state.centerY, z);
+  const left = cx * TILE_SIZE - state.width / 2;
+  const top = cy * TILE_SIZE - state.height / 2;
+  const minX = Math.floor(left / TILE_SIZE) - 1;
+  const maxX = Math.floor((left + state.width) / TILE_SIZE) + 1;
+  const minY = Math.floor(top / TILE_SIZE) - 1;
+  const maxY = Math.floor((top + state.height) / TILE_SIZE) + 1;
+  const needed = new Set();
+  for (let tx = minX; tx <= maxX; tx++) {
+    for (let ty = minY; ty <= maxY; ty++) {
+      if (ty < 0 || ty >= n) continue;
+      const x = ((tx % n) + n) % n;
+      const key = `${state.basemap}:${z}:${x}:${ty}`;
+      needed.add(key);
+      let img = state.tileEls.get(key);
+      if (!img) {
+        img = new Image();
+        img.className = 'map-tile';
+        img.decoding = 'async';
+        img.referrerPolicy = state.basemap === 'osm' ? 'strict-origin-when-cross-origin' : 'no-referrer';
+        img.onload = () => img.classList.remove('failed');
+        img.onerror = () => img.classList.add('failed');
+        img.src = base.url(z, x, ty);
+        state.tileEls.set(key, img);
+        tilesEl.appendChild(img);
+      }
+      img.style.left = `${tx * TILE_SIZE - left}px`;
+      img.style.top = `${ty * TILE_SIZE - top}px`;
+    }
+  }
+  for (const [key, el] of state.tileEls) {
+    if (!needed.has(key)) {
+      el.remove();
+      state.tileEls.delete(key);
+    }
+  }
+}
+
+function wmViewportBounds() {
+  return [worldX(0), worldY(state.height), worldX(state.width), worldY(0)];
+}
+
+function intersects(a, b) {
+  return a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
+}
+
+function viewportUtmBounds() {
+  const corners = [
+    UTM.wmToUtm(worldX(0), worldY(0)),
+    UTM.wmToUtm(worldX(state.width), worldY(0)),
+    UTM.wmToUtm(worldX(0), worldY(state.height)),
+    UTM.wmToUtm(worldX(state.width), worldY(state.height))
+  ];
+  return [
+    Math.min(...corners.map(p => p[0])),
+    Math.min(...corners.map(p => p[1])),
+    Math.max(...corners.map(p => p[0])),
+    Math.max(...corners.map(p => p[1]))
+  ];
+}
+
+function buildOverviewIndex() {
+  state.overviewBins.clear();
+  if (!state.overview) return;
+  const binSize = 30000;
+  const view = state.overview;
+  const count = view.byteLength / OVERVIEW_RECORD;
+  for (let i = 0; i < count; i++) {
+    const o = i * OVERVIEW_RECORD;
+    const x = view.getFloat32(o, true);
+    const y = view.getFloat32(o + 4, true);
+    const key = `${Math.floor(x / binSize)},${Math.floor(y / binSize)}`;
+    let arr = state.overviewBins.get(key);
+    if (!arr) state.overviewBins.set(key, arr = []);
+    arr.push(i);
+  }
+}
+
+function overviewCandidates() {
+  if (!state.overview) return [];
+  const b = wmViewportBounds();
+  const binSize = 30000;
+  const out = [];
+  for (let ix = Math.floor(b[0] / binSize); ix <= Math.floor(b[2] / binSize); ix++) {
+    for (let iy = Math.floor(b[1] / binSize); iy <= Math.floor(b[3] / binSize); iy++) {
+      const arr = state.overviewBins.get(`${ix},${iy}`);
+      if (arr) out.push(...arr);
+    }
+  }
+  return out;
+}
+
+function drawOverview() {
+  if (!state.overview) return;
+  const view = state.overview;
+  const candidates = overviewCandidates();
+  const size = state.zoom <= 7 ? 1.3 : state.zoom <= 9 ? 1.8 : 2.5;
+  const grouped = new Map();
+  for (const i of candidates) {
+    const o = i * OVERVIEW_RECORD;
+    const num = view.getUint16(o + 8, true);
+    if (!state.enabled.has(num)) continue;
+    let arr = grouped.get(num);
+    if (!arr) grouped.set(num, arr = []);
+    arr.push(i);
+  }
+  for (const [num, indices] of grouped) {
+    const meta = state.metaByNum.get(num);
+    if (!meta) continue;
+    ctx.fillStyle = rgba(meta.color, Math.min(0.82, state.opacity));
+    ctx.beginPath();
+    for (const i of indices) {
+      const o = i * OVERVIEW_RECORD;
+      const px = screenX(view.getFloat32(o, true));
+      const py = screenY(view.getFloat32(o + 4, true));
+      if (size <= 1.5) ctx.rect(px, py, size, size);
+      else {
+        ctx.moveTo(px + size, py);
+        ctx.arc(px, py, size, 0, Math.PI * 2);
+      }
+    }
+    ctx.fill();
+  }
+}
+
+function binaryLowerCol(layer, start, end, col) {
+  let lo = start, hi = end;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    const c = layer.view.getUint16(mid * DETAIL_RECORD + 2, true);
+    if (c < col) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+function layerIndicesInUtm(layer, bounds, limit = Infinity) {
+  const grid = state.manifest.grid;
+  let rowMin = Math.floor((bounds[1] - grid.origin_y) / grid.cell_size_m);
+  let rowMax = Math.floor((bounds[3] - grid.origin_y) / grid.cell_size_m);
+  let colMin = Math.floor((bounds[0] - grid.origin_x) / grid.cell_size_m);
+  let colMax = Math.floor((bounds[2] - grid.origin_x) / grid.cell_size_m);
+  rowMin = Math.max(0, rowMin); rowMax = Math.min(grid.max_row, rowMax);
+  colMin = Math.max(0, colMin); colMax = Math.min(grid.max_col, colMax);
+  const out = [];
+  if (rowMin > rowMax || colMin > colMax) return out;
+  for (let row = rowMin; row <= rowMax; row++) {
+    const start = layer.rowStart[row];
+    if (start < 0) continue;
+    const end = layer.rowEnd[row];
+    let i = binaryLowerCol(layer, start, end, colMin);
+    while (i < end) {
+      const col = layer.view.getUint16(i * DETAIL_RECORD + 2, true);
+      if (col > colMax) break;
+      out.push(i);
+      if (out.length >= limit) return out;
+      i++;
+    }
+  }
+  return out;
+}
+
+function cellRecord(layer, index) {
+  const o = index * DETAIL_RECORD;
+  return {
+    row: layer.view.getUint16(o, true),
+    col: layer.view.getUint16(o + 2, true),
+    ekatte: layer.view.getUint32(o + 4, true),
+    urban: layer.view.getUint8(o + 8),
+    coverage: layer.view.getUint8(o + 9)
+  };
+}
+
+function cellUtm(row, col) {
+  const g = state.manifest.grid;
+  return [g.origin_x + col * g.cell_size_m, g.origin_y + row * g.cell_size_m];
+}
+
+function drawDetailLayer(layer, indices) {
+  const meta = layer.meta;
+  ctx.fillStyle = rgba(meta.color, 0.14 * state.opacity);
+  ctx.strokeStyle = rgba(meta.color, Math.min(0.95, state.opacity));
+  ctx.lineWidth = state.zoom >= 16 ? 1.2 : 0.65;
+  const size = state.manifest.grid.cell_size_m;
+  for (const index of indices) {
+    const o = index * DETAIL_RECORD;
+    const row = layer.view.getUint16(o, true);
+    const col = layer.view.getUint16(o + 2, true);
+    const [x0, y0] = cellUtm(row, col);
+    const corners = [
+      UTM.utmToWm(x0, y0), UTM.utmToWm(x0, y0 + size),
+      UTM.utmToWm(x0 + size, y0 + size), UTM.utmToWm(x0 + size, y0)
+    ];
+    ctx.beginPath();
+    corners.forEach((p, k) => {
+      const x = screenX(p[0]), y = screenY(p[1]);
+      if (k) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    });
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  }
+}
+
+function drawSelections() {
+  const size = state.manifest.grid.cell_size_m;
+  ctx.fillStyle = 'rgba(255,216,20,.38)';
+  ctx.strokeStyle = '#4a3900';
+  ctx.lineWidth = 2.1;
+  const viewUtm = viewportUtmBounds();
+  for (const [num, selected] of state.selection) {
+    const layer = state.loaded.get(num);
+    if (!layer) continue;
+    for (const index of selected) {
+      const rec = cellRecord(layer, index);
+      const [x0, y0] = cellUtm(rec.row, rec.col);
+      if (x0 > viewUtm[2] || x0 + size < viewUtm[0] || y0 > viewUtm[3] || y0 + size < viewUtm[1]) continue;
+      const corners = [
+        UTM.utmToWm(x0, y0), UTM.utmToWm(x0, y0 + size),
+        UTM.utmToWm(x0 + size, y0 + size), UTM.utmToWm(x0 + size, y0)
+      ];
+      ctx.beginPath();
+      corners.forEach((p, k) => {
+        const x = screenX(p[0]), y = screenY(p[1]);
+        if (k) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      });
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+}
+
+function renderVectors() {
+  ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
+  ctx.clearRect(0, 0, state.width, state.height);
+  if (!state.manifest || !state.overview) return;
+  const detailMode = state.zoom >= DETAIL_ZOOM;
+  if (!detailMode) {
+    drawOverview();
+  } else {
+    const utmBounds = viewportUtmBounds();
+    let drewDetail = false;
+    for (const [num, layer] of state.loaded) {
+      if (!state.enabled.has(num)) continue;
+      if (!intersects(layer.meta.bounds_wm, wmViewportBounds())) continue;
+      const indices = layerIndicesInUtm(layer, utmBounds, 150000);
+      if (indices.length) {
+        drawDetailLayer(layer, indices);
+        drewDetail = true;
+      }
+    }
+    if (!drewDetail || state.loading.size) drawOverview();
+  }
+  drawSelections();
+  $('map-message').style.display = 'none';
+}
+
+function render() {
+  if (!state.manifest) return;
+  renderTiles();
+  renderVectors();
+  updateCoordinates();
+  if (state.zoom >= DETAIL_ZOOM && $('auto-load').checked) scheduleVisibleLoads();
+}
+
+function updateCoordinates() {
+  const [lon, lat] = wmToLonLat(state.centerX, state.centerY);
+  $('coordinates').textContent = `Център: ${lat.toFixed(5)}, ${lon.toFixed(5)} · zoom ${state.zoom}`;
+}
+
+function buildRowIndex(view, count) {
+  const maxRow = state.manifest.grid.max_row;
+  const rowStart = new Int32Array(maxRow + 1);
+  const rowEnd = new Int32Array(maxRow + 1);
+  rowStart.fill(-1); rowEnd.fill(-1);
+  let previous = -1;
+  for (let i = 0; i < count; i++) {
+    const row = view.getUint16(i * DETAIL_RECORD, true);
+    if (row !== previous) {
+      rowStart[row] = i;
+      if (previous >= 0) rowEnd[previous] = i;
+      previous = row;
+    }
+  }
+  if (previous >= 0) rowEnd[previous] = count;
+  return { rowStart, rowEnd };
+}
+
+async function loadLayer(num, reason = 'view') {
+  if (state.loaded.has(num)) return state.loaded.get(num);
+  if (state.loading.has(num)) return state.loading.get(num);
+  const meta = state.metaByNum.get(num);
+  if (!meta) throw new Error(`Непознат слой ${num}`);
+  const promise = (async () => {
+    state.activeLoads++;
+    updateLoadingLabel();
+    try {
+      const response = await fetch(meta.url, { cache: 'force-cache' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const buffer = await response.arrayBuffer();
+      if (buffer.byteLength !== meta.count * DETAIL_RECORD) throw new Error(`Невалиден размер на ${meta.id}`);
+      const view = new DataView(buffer);
+      const rows = buildRowIndex(view, meta.count);
+      const layer = { meta, buffer, view, rowStart: rows.rowStart, rowEnd: rows.rowEnd, lastUsed: Date.now() };
+      state.loaded.set(num, layer);
+      updateLayerLoadedUi(num);
+      updateMetrics();
+      if (reason !== 'silent') render();
+      return layer;
+    } finally {
+      state.loading.delete(num);
+      state.activeLoads--;
+      updateLoadingLabel();
+      pumpLoadQueue();
+    }
+  })();
+  state.loading.set(num, promise);
+  return promise;
+}
+
+function updateLoadingLabel() {
+  const active = state.loading.size > 0 || state.loadQueue.length > 0;
+  setLoading(active, `Слоеве: ${state.loaded.size} заредени · ${state.loading.size} в процес`);
+}
+
+function queueLayer(num) {
+  if (state.loaded.has(num) || state.loading.has(num) || state.loadQueue.includes(num)) return;
+  state.loadQueue.push(num);
+  pumpLoadQueue();
+}
+
+function pumpLoadQueue() {
+  while (state.activeLoads < MAX_AUTO_LOAD && state.loadQueue.length) {
+    const num = state.loadQueue.shift();
+    if (!state.enabled.has(num)) continue;
+    loadLayer(num, 'silent').catch(error => showToast(`${state.metaByNum.get(num)?.id || num}: ${error.message}`));
+  }
+  if (!state.loadQueue.length && !state.loading.size) render();
+}
+
+function scheduleVisibleLoads() {
+  clearTimeout(state.visibleLoadTimer);
+  state.visibleLoadTimer = setTimeout(() => {
+    const bounds = wmViewportBounds();
+    const visible = state.manifest.layers
+      .filter(m => state.enabled.has(m.num) && intersects(m.bounds_wm, bounds))
+      .sort((a, b) => a.count - b.count);
+    visible.forEach(m => queueLayer(m.num));
+  }, 180);
+}
+
+function unloadLayer(num) {
+  if (state.selection.get(num)?.size) {
+    showToast('Слоят има избрани клетки и не беше освободен.');
+    return;
+  }
+  state.loaded.delete(num);
+  updateLayerLoadedUi(num);
+  updateMetrics();
+  render();
+}
+
+function updateLayerLoadedUi(num) {
+  const row = document.querySelector(`.municipality-row[data-num="${num}"]`);
+  if (!row) return;
+  row.querySelector('.load-dot')?.classList.toggle('loaded', state.loaded.has(num));
+  const btn = row.querySelector('.layer-load');
+  if (btn) {
+    btn.textContent = state.loaded.has(num) ? '×' : '↓';
+    btn.title = state.loaded.has(num) ? 'Освободи геометрията от паметта' : 'Зареди слоя';
+  }
+}
+
+function updateMetrics() {
+  if (!state.manifest) return;
+  $('metric-cells').textContent = formatNumber(state.manifest.total_cells);
+  $('metric-regions').textContent = state.manifest.region_count;
+  $('metric-layers').textContent = state.manifest.layer_count;
+  $('metric-loaded').textContent = state.loaded.size;
+}
+
+function renderLayerTree(filter = '') {
+  const query = filter.trim().toUpperCase();
+  const container = $('region-list');
+  container.innerHTML = '';
+  for (const region of state.manifest.regions) {
+    const layers = region.layers.map(n => state.metaByNum.get(n)).filter(Boolean);
+    const visibleLayers = query ? layers.filter(m => m.id.includes(query) || m.region.includes(query)) : layers;
+    if (!visibleLayers.length) continue;
+    const details = document.createElement('details');
+    details.className = 'region-group';
+    details.dataset.region = region.id;
+    if (query) details.open = true;
+    const checkedCount = layers.filter(m => state.enabled.has(m.num)).length;
+    const allChecked = checkedCount === layers.length;
+    const summary = document.createElement('summary');
+    summary.className = 'region-summary';
+    summary.innerHTML = `
+      <input type="checkbox" class="region-check" ${allChecked ? 'checked' : ''} ${checkedCount && !allChecked ? 'data-indeterminate="1"' : ''}>
+      <span class="swatch" style="background:${region.color}"></span>
+      <div><strong>${region.id}</strong><br><span class="meta">${layers.length} общини</span></div>
+      <span class="region-count">${formatNumber(region.count)}</span>
+      <span class="region-chevron">›</span>`;
+    details.appendChild(summary);
+    const list = document.createElement('div');
+    list.className = 'municipality-list';
+    for (const meta of visibleLayers) {
+      const row = document.createElement('div');
+      row.className = 'municipality-row';
+      row.dataset.num = meta.num;
+      row.innerHTML = `
+        <input type="checkbox" class="layer-check" ${state.enabled.has(meta.num) ? 'checked' : ''}>
+        <div><strong>${meta.id}</strong><br><span>${formatNumber(meta.count)} клетки · ${formatBytes(meta.bytes)}</span></div>
+        <span class="load-dot ${state.loaded.has(meta.num) ? 'loaded' : ''}" title="${state.loaded.has(meta.num) ? 'Зареден' : 'Не е зареден'}"></span>
+        <span><button class="mini-button layer-fit" title="Приближи до слоя">⌖</button><button class="mini-button layer-load" title="${state.loaded.has(meta.num) ? 'Освободи геометрията' : 'Зареди слоя'}">${state.loaded.has(meta.num) ? '×' : '↓'}</button></span>`;
+      row.querySelector('.layer-check').addEventListener('change', event => {
+        if (event.target.checked) state.enabled.add(meta.num); else state.enabled.delete(meta.num);
+        render();
+        renderLayerTree($('layer-filter').value);
+      });
+      row.querySelector('.layer-fit').addEventListener('click', event => {
+        event.stopPropagation();
+        state.enabled.add(meta.num);
+        fitBounds(meta.bounds_wm, 90, 15);
+      });
+      row.querySelector('.layer-load').addEventListener('click', async event => {
+        event.stopPropagation();
+        if (state.loaded.has(meta.num)) unloadLayer(meta.num);
+        else {
+          state.enabled.add(meta.num);
+          try { await loadLayer(meta.num); } catch (error) { showToast(error.message); }
+        }
+      });
+      list.appendChild(row);
+    }
+    details.appendChild(list);
+    const regionCheck = summary.querySelector('.region-check');
+    regionCheck.indeterminate = checkedCount > 0 && !allChecked;
+    regionCheck.addEventListener('click', event => event.stopPropagation());
+    regionCheck.addEventListener('change', event => {
+      for (const meta of layers) {
+        if (event.target.checked) state.enabled.add(meta.num); else state.enabled.delete(meta.num);
+      }
+      renderLayerTree($('layer-filter').value);
+      render();
+    });
+    container.appendChild(details);
+  }
+}
+
+function lookupFileForRow(row) {
+  return state.manifest.lookup_files.find(f => row >= f.start_row && row < f.end_row);
+}
+
+async function loadLookupBlock(row) {
+  const file = lookupFileForRow(row);
+  if (!file) return null;
+  if (state.lookupCache.has(file.start_row)) return state.lookupCache.get(file.start_row);
+  const promise = fetch(file.url, { cache: 'force-cache' }).then(async response => {
+    if (!response.ok) throw new Error(`Lookup HTTP ${response.status}`);
+    const buffer = await response.arrayBuffer();
+    const expected = (file.end_row - file.start_row) * state.manifest.grid.lookup_width * 2;
+    if (buffer.byteLength !== expected) throw new Error('Невалиден lookup блок');
+    return { file, view: new DataView(buffer) };
+  });
+  state.lookupCache.set(file.start_row, promise);
+  try {
+    const block = await promise;
+    state.lookupCache.set(file.start_row, block);
+    return block;
+  } catch (error) {
+    state.lookupCache.delete(file.start_row);
+    throw error;
+  }
+}
+
+async function layerNumForGrid(row, col) {
+  const g = state.manifest.grid;
+  if (row < 0 || row > g.max_row || col < 0 || col > g.max_col) return 0;
+  const block = await loadLookupBlock(row);
+  if (!block) return 0;
+  const localRow = row - block.file.start_row;
+  const offset = (localRow * g.lookup_width + col) * 2;
+  return block.view.getUint16(offset, true);
+}
+
+function findCellIndex(layer, row, col) {
+  const start = layer.rowStart[row];
+  if (start < 0) return -1;
+  const end = layer.rowEnd[row];
+  let lo = start, hi = end - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const c = layer.view.getUint16(mid * DETAIL_RECORD + 2, true);
+    if (c === col) return mid;
+    if (c < col) lo = mid + 1; else hi = mid - 1;
+  }
+  return -1;
+}
+
+async function locateGrid(row, col, add = false, openPopup = true) {
+  const num = await layerNumForGrid(row, col);
+  if (!num) return null;
+  state.enabled.add(num);
+  const layer = await loadLayer(num);
+  const index = findCellIndex(layer, row, col);
+  if (index < 0) throw new Error('GridCode е в lookup индекса, но липсва в слоя.');
+  selectCell(layer, index, add, openPopup);
+  return { layer, index };
+}
+
+function selectCell(layer, index, add = false, openPopup = true) {
+  if (!add) clearSelection(false);
+  let set = state.selection.get(layer.meta.num);
+  if (!set) state.selection.set(layer.meta.num, set = new Set());
+  set.add(index);
+  updateSelectionCount();
+  if (openPopup) showCellPopup(layer, index);
+  renderVectors();
+}
+
+function showCellPopup(layer, index) {
+  const rec = cellRecord(layer, index);
+  const [x0, y0] = cellUtm(rec.row, rec.col);
+  const [lon, lat] = UTM.utmToLonLat(x0 + 50, y0 + 50);
+  const popup = $('cell-popup');
+  popup.innerHTML = `
+    <h3>${rec.row}-${rec.col}</h3>
+    <table>
+      <tr><td>Община</td><td><b>${layer.meta.id}</b></td></tr>
+      <tr><td>Област</td><td>${layer.meta.region}</td></tr>
+      <tr><td>GridCode</td><td>${rec.row}-${rec.col}</td></tr>
+      <tr><td>EKATTE</td><td>${String(rec.ekatte).padStart(5, '0')}</td></tr>
+      <tr><td>Градска клетка</td><td>${rec.urban ? 'Да' : 'Не'}</td></tr>
+      <tr><td>В покритие</td><td>${rec.coverage ? 'Да' : 'Не'}</td></tr>
+      <tr><td>Площ</td><td>10 000 m²</td></tr>
+      <tr><td>Център</td><td>${lat.toFixed(6)}, ${lon.toFixed(6)}</td></tr>
+    </table>`;
+  popup.style.display = 'block';
+}
+
+function clearSelection(redraw = true) {
+  state.selection.clear();
+  $('cell-popup').style.display = 'none';
+  updateSelectionCount();
+  if (redraw) renderVectors();
+}
+
+function selectedCount() {
+  let count = 0;
+  for (const set of state.selection.values()) count += set.size;
+  return count;
+}
+
+function updateSelectionCount() {
+  $('selected-count').textContent = formatNumber(selectedCount());
+}
+
+async function ensureLayersForBounds(boundsWm) {
+  const metas = state.manifest.layers.filter(m => state.enabled.has(m.num) && intersects(m.bounds_wm, boundsWm));
+  const missing = metas.filter(m => !state.loaded.has(m.num));
+  if (missing.length) setLoading(true, `Зареждане на ${missing.length} видими слоя…`);
+  for (let i = 0; i < missing.length; i += 4) {
+    await Promise.all(missing.slice(i, i + 4).map(m => loadLayer(m.num, 'silent')));
+  }
+  setLoading(false);
+  return metas;
+}
+
+async function selectUtmBounds(bounds, add = false) {
+  if (!add) clearSelection(false);
+  const corners = [UTM.utmToWm(bounds[0], bounds[1]), UTM.utmToWm(bounds[0], bounds[3]), UTM.utmToWm(bounds[2], bounds[1]), UTM.utmToWm(bounds[2], bounds[3])];
+  const boundsWm = [Math.min(...corners.map(p => p[0])), Math.min(...corners.map(p => p[1])), Math.max(...corners.map(p => p[0])), Math.max(...corners.map(p => p[1]))];
+  const metas = await ensureLayersForBounds(boundsWm);
+  let remaining = MAX_SELECTION - selectedCount();
+  let added = 0;
+  for (const meta of metas) {
+    if (remaining <= 0) break;
+    const layer = state.loaded.get(meta.num);
+    const indices = layerIndicesInUtm(layer, bounds, remaining);
+    if (!indices.length) continue;
+    let set = state.selection.get(meta.num);
+    if (!set) state.selection.set(meta.num, set = new Set());
+    for (const i of indices) {
+      if (!set.has(i)) { set.add(i); added++; remaining--; }
+      if (remaining <= 0) break;
+    }
+  }
+  updateSelectionCount();
+  renderVectors();
+  if (remaining <= 0) showToast(`Достигнат е лимитът от ${formatNumber(MAX_SELECTION)} клетки.`);
+  else showToast(`Добавени ${formatNumber(added)} клетки.`);
+}
+
+async function search() {
+  const input = $('search-input').value.trim().toUpperCase();
+  const status = $('search-status');
+  if (!input) return setStatus(status, 'Въведете GridCode, EKATTE или код на община.', 'error');
+  setStatus(status, 'Търсене…');
+  try {
+    const gridMatch = input.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (gridMatch) {
+      const row = Number(gridMatch[1]), col = Number(gridMatch[2]);
+      const result = await locateGrid(row, col, false, true);
+      if (!result) return setStatus(status, 'GridCode не присъства в националния набор.', 'error');
+      const [x0, y0] = cellUtm(row, col);
+      const center = UTM.utmToWm(x0 + 50, y0 + 50);
+      state.centerX = center[0]; state.centerY = center[1]; state.zoom = Math.max(state.zoom, 16);
+      render();
+      return setStatus(status, `Намерена клетка в ${result.layer.meta.id}.`, 'ok');
+    }
+    const layerMeta = state.metaById.get(input);
+    if (layerMeta) {
+      state.enabled.add(layerMeta.num);
+      fitBounds(layerMeta.bounds_wm, 90, 15);
+      await loadLayer(layerMeta.num);
+      renderLayerTree($('layer-filter').value);
+      return setStatus(status, `${layerMeta.id}: ${formatNumber(layerMeta.count)} клетки.`, 'ok');
+    }
+    if (/^\d{1,5}$/.test(input)) {
+      const code = String(Number(input));
+      if (code === '0') return setStatus(status, 'EKATTE 0 не е подходящ за търсене.', 'error');
+      const nums = state.manifest.ekatte_layers[code] || [];
+      if (!nums.length) return setStatus(status, 'Няма клетки с този EKATTE код.', 'error');
+      clearSelection(false);
+      let total = 0;
+      let bounds = [Infinity, Infinity, -Infinity, -Infinity];
+      for (const num of nums) {
+        const layer = await loadLayer(num, 'silent');
+        state.enabled.add(num);
+        let set = state.selection.get(num);
+        if (!set) state.selection.set(num, set = new Set());
+        for (let i = 0; i < layer.meta.count && total < MAX_SELECTION; i++) {
+          if (layer.view.getUint32(i * DETAIL_RECORD + 4, true) !== Number(code)) continue;
+          set.add(i); total++;
+          const rec = cellRecord(layer, i);
+          const [x, y] = cellUtm(rec.row, rec.col);
+          bounds[0] = Math.min(bounds[0], x); bounds[1] = Math.min(bounds[1], y);
+          bounds[2] = Math.max(bounds[2], x + 100); bounds[3] = Math.max(bounds[3], y + 100);
+        }
+        if (total >= MAX_SELECTION) break;
+      }
+      updateSelectionCount();
+      if (total) {
+        const corners = [UTM.utmToWm(bounds[0], bounds[1]), UTM.utmToWm(bounds[2], bounds[3])];
+        fitBounds([Math.min(corners[0][0], corners[1][0]), Math.min(corners[0][1], corners[1][1]), Math.max(corners[0][0], corners[1][0]), Math.max(corners[0][1], corners[1][1])], 100, 15);
+      }
+      renderLayerTree($('layer-filter').value);
+      return setStatus(status, `Избрани ${formatNumber(total)} клетки с EKATTE ${input}${total >= MAX_SELECTION ? ' (лимит)' : ''}.`, 'ok');
+    }
+    setStatus(status, 'Непознат формат. Използвайте GridCode, EKATTE или код като SOF46.', 'error');
+  } catch (error) {
+    setStatus(status, error.message, 'error');
+  }
+}
+
+function selectedRows() {
+  const rows = [];
+  for (const [num, set] of state.selection) {
+    const layer = state.loaded.get(num);
+    if (!layer) continue;
+    for (const index of set) {
+      const rec = cellRecord(layer, index);
+      rows.push({ gridcode: `${rec.row}-${rec.col}`, layer: layer.meta.id });
+    }
+  }
+  return rows;
+}
+
+function openCsvDb() {
+  if (csvDbPromise) return csvDbPromise;
+  csvDbPromise = new Promise(resolve => {
+    try {
+      const req = indexedDB.open('EITN_FixedNetCoverage', 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        const store = db.createObjectStore('rows', { keyPath: 'key' });
+        store.createIndex('gridcode', 'gridcode');
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => { csvStorageMode = 'memory'; resolve(null); };
+      req.onblocked = () => { csvStorageMode = 'memory'; resolve(null); };
+    } catch (error) {
+      csvStorageMode = 'memory';
+      resolve(null);
+    }
+  });
+  return csvDbPromise;
+}
+
+function transactionDone(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('Транзакцията беше прекъсната.'));
+  });
+}
+
+async function csvPutMany(rows) {
+  const db = await openCsvDb();
+  if (!db) { for (const row of rows) memoryCsvStore.set(row.key, row); return; }
+  const tx = db.transaction('rows', 'readwrite');
+  const store = tx.objectStore('rows');
+  for (const row of rows) store.put(row);
+  await transactionDone(tx);
+}
+
+async function csvCount() {
+  const db = await openCsvDb();
+  if (!db) return memoryCsvStore.size;
+  return new Promise((resolve, reject) => {
+    const req = db.transaction('rows').objectStore('rows').count();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function csvPreview(limit = 200) {
+  const db = await openCsvDb();
+  if (!db) return [...memoryCsvStore.values()].slice(-limit).reverse();
+  return new Promise((resolve, reject) => {
+    const out = [];
+    const req = db.transaction('rows').objectStore('rows').openCursor(null, 'prev');
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor || out.length >= limit) return resolve(out);
+      out.push(cursor.value);
+      cursor.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function csvDelete(key) {
+  const db = await openCsvDb();
+  if (!db) { memoryCsvStore.delete(key); return; }
+  const tx = db.transaction('rows', 'readwrite');
+  tx.objectStore('rows').delete(key);
+  await transactionDone(tx);
+}
+
+async function csvClear() {
+  const db = await openCsvDb();
+  if (!db) { memoryCsvStore.clear(); return; }
+  const tx = db.transaction('rows', 'readwrite');
+  tx.objectStore('rows').clear();
+  await transactionDone(tx);
+}
+
+async function csvAllRows() {
+  const db = await openCsvDb();
+  if (!db) return [...memoryCsvStore.values()];
+  return new Promise((resolve, reject) => {
+    const out = [];
+    const req = db.transaction('rows').objectStore('rows').openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return resolve(out);
+      out.push(cursor.value);
+      cursor.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function csvEscape(value) {
+  const text = String(value ?? '');
+  return /[;"\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+async function refreshCsvUi() {
+  const count = await csvCount();
+  $('csv-count').textContent = formatNumber(count);
+  const rows = await csvPreview(200);
+  const body = $('csv-table-body');
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">Няма подготвени редове.</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(row => `<tr><td>${row.gridcode}</td><td>${row.layer || '—'}</td><td>${row.values[1]}</td><td>${row.values[3]}</td><td><button class="mini-button csv-remove" data-key="${encodeURIComponent(row.key)}">×</button></td></tr>`).join('');
+  body.querySelectorAll('.csv-remove').forEach(button => button.addEventListener('click', async () => {
+    await csvDelete(decodeURIComponent(button.dataset.key));
+    await refreshCsvUi();
+  }));
+}
+
+function validateCsvForm() {
+  const values = {
+    technology: $('technology').value,
+    vhcn: $('vhcn').value,
+    maxUp: $('max-up').value,
+    maxDown: $('max-down').value,
+    peakUp: $('peak-up').value,
+    peakDown: $('peak-down').value,
+    potential: $('potential').value,
+    served: $('served').value
+  };
+  if (!values.technology || !values.vhcn || !values.maxUp || !values.maxDown || !values.peakUp || !values.peakDown) return { ok: false, error: 'Попълнете технологията, четирите скорости и VHCNClass.' };
+  if (!/^\d+$/.test(values.potential) || !/^\d+$/.test(values.served)) return { ok: false, error: 'Броят клиенти и адреси трябва да е неотрицателно цяло число.' };
+  return { ok: true, values };
+}
+
+async function addSelectionToCsv() {
+  const status = $('form-status');
+  const selected = selectedRows();
+  if (!selected.length) return setStatus(status, 'Няма избрани GridCode клетки.', 'error');
+  const validation = validateCsvForm();
+  if (!validation.ok) return setStatus(status, validation.error, 'error');
+  const v = validation.values;
+  const rows = selected.map(item => {
+    const values = [item.gridcode, v.technology, v.maxUp, v.maxDown, v.peakUp, v.peakDown, v.vhcn, v.potential, v.served];
+    return { key: `${item.gridcode}|${v.technology}`, gridcode: item.gridcode, technology: v.technology, layer: item.layer, values };
+  });
+  setLoading(true, `Запис на ${formatNumber(rows.length)} CSV реда…`);
+  try {
+    for (let i = 0; i < rows.length; i += 5000) await csvPutMany(rows.slice(i, i + 5000));
+    await refreshCsvUi();
+    setStatus(status, `Записани/обновени ${formatNumber(rows.length)} уникални комбинации.`, 'ok');
+  } catch (error) {
+    setStatus(status, error.message, 'error');
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function downloadCsv() {
+  const rows = await csvAllRows();
+  if (!rows.length) return showToast('Няма подготвени CSV редове.');
+  const headers = state.manifest.csv.headers;
+  const lines = [headers.join(';')];
+  for (const row of rows) lines.push(row.values.map(csvEscape).join(';'));
+  const blob = new Blob(['\ufeff', lines.join('\r\n'), '\r\n'], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = state.manifest.csv.filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+  showToast(`Експортирани ${formatNumber(rows.length)} реда.`);
+}
+
+function parseSemicolonCsv(text) {
+  const rows = [];
+  let row = [], cell = '', quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (c === '"') quoted = false;
+      else cell += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ';') { row.push(cell); cell = ''; }
+    else if (c === '\n') { row.push(cell.replace(/\r$/, '')); rows.push(row); row = []; cell = ''; }
+    else cell += c;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+
+async function importCsv(file) {
+  if (!file) return;
+  const status = $('form-status');
+  try {
+    const rows = parseSemicolonCsv(await file.text());
+    if (!rows.length) throw new Error('CSV файлът е празен.');
+    const headers = rows.shift().map(v => v.replace(/^\ufeff/, '').trim());
+    if (state.manifest.csv.headers.some((h, i) => headers[i] !== h)) throw new Error('Заглавията не съвпадат с изискваните девет колони.');
+    const validTech = new Set(state.manifest.csv.technologies);
+    const validSpeed = new Set(state.manifest.csv.speeds);
+    const validVhcn = new Set(state.manifest.csv.vhcn);
+    const items = [];
+    let rejected = 0;
+    for (const values of rows) {
+      if (values.length < 9 || !/^\d+-\d+$/.test(values[0]) || !validTech.has(values[1]) || !validSpeed.has(values[2]) || !validSpeed.has(values[3]) || !validSpeed.has(values[4]) || !validSpeed.has(values[5]) || !validVhcn.has(values[6]) || !/^\d+$/.test(values[7]) || !/^\d+$/.test(values[8])) { rejected++; continue; }
+      items.push({ key: `${values[0]}|${values[1]}`, gridcode: values[0], technology: values[1], layer: 'import', values: values.slice(0, 9) });
+    }
+    for (let i = 0; i < items.length; i += 5000) await csvPutMany(items.slice(i, i + 5000));
+    await refreshCsvUi();
+    setStatus(status, `Импортирани ${formatNumber(items.length)} реда${rejected ? `; отхвърлени ${formatNumber(rejected)}` : ''}.`, rejected ? '' : 'ok');
+  } catch (error) {
+    setStatus(status, error.message, 'error');
+  }
+}
+
+function populateCsvForm() {
+  const csv = state.manifest.csv;
+  $('technology').innerHTML = '<option value="">Изберете…</option>' + csv.technologies.map(v => `<option value="${v}">${v}</option>`).join('');
+  $('vhcn').innerHTML = '<option value="">—</option>' + csv.vhcn.map(v => `<option value="${v}">${v}</option>`).join('');
+  document.querySelectorAll('.speed-select').forEach(select => {
+    select.innerHTML = '<option value="">—</option>' + csv.speeds.map(v => `<option value="${v}">${v}</option>`).join('');
+  });
+}
+
+async function loadManifestAndOverview() {
+  const response = await fetch('data/manifest.json', { cache: 'no-store' });
+  if (!response.ok) throw new Error(`manifest.json: HTTP ${response.status}`);
+  state.manifest = await response.json();
+  for (const meta of state.manifest.layers) {
+    state.metaByNum.set(meta.num, meta);
+    state.metaById.set(meta.id.toUpperCase(), meta);
+    state.enabled.add(meta.num);
+  }
+  const overviewResponse = await fetch(state.manifest.overview.url, { cache: 'force-cache' });
+  if (!overviewResponse.ok) throw new Error(`overview.bin: HTTP ${overviewResponse.status}`);
+  const overviewBuffer = await overviewResponse.arrayBuffer();
+  if (overviewBuffer.byteLength !== state.manifest.overview.count * OVERVIEW_RECORD) throw new Error('Невалиден overview.bin');
+  state.overview = new DataView(overviewBuffer);
+  buildOverviewIndex();
+  state.centerX = (state.manifest.bounds_wm[0] + state.manifest.bounds_wm[2]) / 2;
+  state.centerY = (state.manifest.bounds_wm[1] + state.manifest.bounds_wm[3]) / 2;
+  updateMetrics();
+  populateCsvForm();
+  renderLayerTree();
+  fitBounds(state.manifest.bounds_wm, 100, 9);
+  await refreshCsvUi();
+}
+
+function bindEvents() {
+  mapEl.addEventListener('wheel', event => {
+    event.preventDefault();
+    const rect = mapEl.getBoundingClientRect();
+    const px = event.clientX - rect.left, py = event.clientY - rect.top;
+    const anchorX = worldX(px), anchorY = worldY(py);
+    const old = state.zoom;
+    state.zoom = Math.max(5, Math.min(20, state.zoom + (event.deltaY < 0 ? 1 : -1)));
+    if (state.zoom !== old) {
+      state.centerX = anchorX - (px - state.width / 2) / mapScale();
+      state.centerY = anchorY + (py - state.height / 2) / mapScale();
+      render();
+    }
+  }, { passive: false });
+
+  mapEl.addEventListener('pointerdown', event => {
+    if (event.target.closest('.panel') || event.target.closest('dialog')) return;
+    state.pointerId = event.pointerId;
+    mapEl.setPointerCapture(event.pointerId);
+    state.dragging = true;
+    state.moved = false;
+    state.lastX = event.clientX;
+    state.lastY = event.clientY;
+    mapEl.classList.add('dragging');
+    if (state.tool === 'box') {
+      const rect = mapEl.getBoundingClientRect();
+      state.boxStart = [event.clientX - rect.left, event.clientY - rect.top];
+      dragBox.style.display = 'block';
+      dragBox.style.left = `${state.boxStart[0]}px`;
+      dragBox.style.top = `${state.boxStart[1]}px`;
+      dragBox.style.width = '0px';
+      dragBox.style.height = '0px';
+    }
+  });
+
+  mapEl.addEventListener('pointermove', event => {
+    const rect = mapEl.getBoundingClientRect();
+    const px = event.clientX - rect.left, py = event.clientY - rect.top;
+    const [lon, lat] = wmToLonLat(worldX(px), worldY(py));
+    $('coordinates').textContent = `${lat.toFixed(6)}, ${lon.toFixed(6)} · zoom ${state.zoom}`;
+    if (!state.dragging) return;
+    const dx = event.clientX - state.lastX, dy = event.clientY - state.lastY;
+    if (Math.abs(dx) + Math.abs(dy) > 2) state.moved = true;
+    if (state.tool === 'pan') {
+      state.centerX -= dx / mapScale();
+      state.centerY += dy / mapScale();
+      state.lastX = event.clientX;
+      state.lastY = event.clientY;
+      render();
+    } else if (state.boxStart) {
+      const x = Math.min(state.boxStart[0], px), y = Math.min(state.boxStart[1], py);
+      dragBox.style.left = `${x}px`; dragBox.style.top = `${y}px`;
+      dragBox.style.width = `${Math.abs(px - state.boxStart[0])}px`;
+      dragBox.style.height = `${Math.abs(py - state.boxStart[1])}px`;
+    }
+  });
+
+  mapEl.addEventListener('pointerup', async event => {
+    if (!state.dragging) return;
+    state.dragging = false;
+    mapEl.classList.remove('dragging');
+    const rect = mapEl.getBoundingClientRect();
+    const px = event.clientX - rect.left, py = event.clientY - rect.top;
+    try {
+      if (state.tool === 'box' && state.boxStart) {
+        dragBox.style.display = 'none';
+        if (state.zoom < DETAIL_ZOOM) showToast(`Приближете до zoom ${DETAIL_ZOOM}+ за селекция.`);
+        else {
+          const x1 = worldX(state.boxStart[0]), y1 = worldY(state.boxStart[1]);
+          const x2 = worldX(px), y2 = worldY(py);
+          const corners = [UTM.wmToUtm(x1, y1), UTM.wmToUtm(x1, y2), UTM.wmToUtm(x2, y1), UTM.wmToUtm(x2, y2)];
+          const bounds = [Math.min(...corners.map(p => p[0])), Math.min(...corners.map(p => p[1])), Math.max(...corners.map(p => p[0])), Math.max(...corners.map(p => p[1]))];
+          await selectUtmBounds(bounds, event.ctrlKey || event.metaKey);
+        }
+        state.boxStart = null;
+      } else if (!state.moved) {
+        const [ux, uy] = UTM.wmToUtm(worldX(px), worldY(py));
+        const g = state.manifest.grid;
+        const row = Math.floor((uy - g.origin_y) / g.cell_size_m);
+        const col = Math.floor((ux - g.origin_x) / g.cell_size_m);
+        const result = await locateGrid(row, col, event.ctrlKey || event.metaKey, true);
+        if (!result) showToast('На това място няма GridCode клетка.');
+      }
+    } catch (error) {
+      showToast(error.message);
+    }
+  });
+
+  document.querySelectorAll('[data-tool]').forEach(button => button.addEventListener('click', () => {
+    state.tool = button.dataset.tool;
+    document.querySelectorAll('[data-tool]').forEach(b => b.classList.toggle('active', b === button));
+    showToast(state.tool === 'box' ? 'Правоъгълна селекция' : 'Режим преместване');
+  }));
+
+  $('zoom-in').addEventListener('click', () => { state.zoom = Math.min(20, state.zoom + 1); render(); });
+  $('zoom-out').addEventListener('click', () => { state.zoom = Math.max(5, state.zoom - 1); render(); });
+  $('fullscreen').addEventListener('click', () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen());
+  $('fit-country').addEventListener('click', () => fitBounds(state.manifest.bounds_wm, 100, 9));
+  $('select-visible').addEventListener('click', async () => {
+    if (state.zoom < DETAIL_ZOOM) return showToast(`Приближете до zoom ${DETAIL_ZOOM}+.`);
+    const b = viewportUtmBounds();
+    await selectUtmBounds(b, false);
+  });
+  $('basemap-select').addEventListener('change', event => { state.basemap = event.target.value; renderTiles(); });
+  $('opacity').addEventListener('input', event => { state.opacity = Number(event.target.value) / 100; $('opacity-value').textContent = `${event.target.value}%`; renderVectors(); });
+  $('auto-load').addEventListener('change', () => render());
+  $('search-button').addEventListener('click', search);
+  $('search-input').addEventListener('keydown', event => { if (event.key === 'Enter') search(); });
+  $('layer-filter').addEventListener('input', event => renderLayerTree(event.target.value));
+  $('enable-all').addEventListener('click', () => { state.manifest.layers.forEach(m => state.enabled.add(m.num)); renderLayerTree($('layer-filter').value); render(); });
+  $('disable-all').addEventListener('click', () => { state.enabled.clear(); clearSelection(false); renderLayerTree($('layer-filter').value); render(); });
+  $('clear-selection').addEventListener('click', () => clearSelection());
+  $('add-csv').addEventListener('click', addSelectionToCsv);
+  $('download-csv').addEventListener('click', downloadCsv);
+  $('csv-import').addEventListener('change', event => importCsv(event.target.files[0]));
+  $('clear-csv').addEventListener('click', async () => {
+    if (!confirm('Да се изтрие ли целият локален CSV работен набор?')) return;
+    await csvClear();
+    await refreshCsvUi();
+  });
+  $('csv-collapse').addEventListener('click', () => $('csv-panel').classList.toggle('collapsed'));
+  $('help-btn').addEventListener('click', () => $('help-dialog').showModal());
+  $('help-close').addEventListener('click', () => $('help-dialog').close());
+  window.addEventListener('resize', resize);
+}
+
+async function start() {
+  bindEvents();
+  resize();
+  setLoading(true, 'Зареждане на manifest и национален обзор…');
+  try {
+    await loadManifestAndOverview();
+    $('app-state').textContent = 'READY';
+    $('app-state').className = 'pill success';
+    showToast(`Готово: ${formatNumber(state.manifest.total_cells)} клетки.`);
+  } catch (error) {
+    console.error(error);
+    $('app-state').textContent = 'ERROR';
+    $('app-state').className = 'pill error';
+    $('map-message').innerHTML = `<strong>Картата не може да се зареди</strong><span>${error.message}. Уверете се, че проектът е отворен през web адрес, а не като локален file:// файл.</span>`;
+    $('map-message').style.display = 'flex';
+  } finally {
+    setLoading(false);
+  }
+}
+
+start();
+})();

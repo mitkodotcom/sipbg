@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="bg">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0b3558">
+  <meta name="description" content="EITN 100×100 m grid viewer and fixed network coverage CSV workspace">
+  <title>EITN Grid Workspace</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="manifest" href="site.webmanifest.html">
+  <link rel="stylesheet" href="assets/styles.css%3Fv=2.0.0.css">
+</head>
+<body>
+<div id="app">
+  <main id="map" aria-label="Интерактивна карта">
+    <div id="tiles" aria-hidden="true"></div>
+    <canvas id="grid-canvas"></canvas>
+    <div id="drag-box"></div>
+    <div id="map-message" class="map-message">
+      <strong>Зареждане на националната 100×100 m мрежа</strong>
+      <span>Подготовка на 28 области и 264 общински слоя…</span>
+    </div>
+  </main>
+
+  <aside id="left-panel" class="panel sidebar">
+    <header class="brand">
+      <div class="brand-logo">EITN</div>
+      <div class="brand-copy">
+        <h1>Grid Workspace</h1>
+        <p>Фиксирано покритие · 100×100 m</p>
+      </div>
+      <span id="app-state" class="pill success">STATIC</span>
+    </header>
+
+    <section class="metric-grid">
+      <div class="metric"><strong id="metric-cells">—</strong><span>клетки</span></div>
+      <div class="metric"><strong id="metric-regions">—</strong><span>области</span></div>
+      <div class="metric"><strong id="metric-layers">—</strong><span>общини</span></div>
+      <div class="metric"><strong id="metric-loaded">0</strong><span>заредени</span></div>
+    </section>
+
+    <section class="section">
+      <div class="section-title-row">
+        <div><span class="eyebrow">Търсене</span><h2>GridCode, EKATTE или слой</h2></div>
+        <button id="help-btn" class="icon-button" title="Информация">?</button>
+      </div>
+      <div class="search-grid">
+        <input id="search-input" type="text" autocomplete="off" placeholder="напр. 1351-1039, 68134 или SOF46">
+        <button id="search-button" class="primary">Намери</button>
+      </div>
+      <div id="search-status" class="status">GridCode се открива без предварително зареждане на общината.</div>
+    </section>
+
+    <section class="section layers-section">
+      <div class="section-title-row">
+        <div><span class="eyebrow">Данни</span><h2>Области и общини</h2></div>
+        <button id="fit-country" class="icon-button" title="Покажи България">⌖</button>
+      </div>
+      <div class="layer-tools">
+        <input id="layer-filter" type="text" placeholder="Филтър по код…">
+        <button id="enable-all">Всички</button>
+        <button id="disable-all">Нито един</button>
+      </div>
+      <div id="region-list" class="region-list"></div>
+    </section>
+
+    <section class="section compact">
+      <span class="eyebrow">Картографски изглед</span>
+      <div class="control-grid">
+        <label>Подложка
+          <select id="basemap-select">
+            <option value="osm">OpenStreetMap</option>
+            <option value="sat">Сателитна</option>
+            <option value="topo">Топографска</option>
+            <option value="none">Само Grid</option>
+          </select>
+        </label>
+        <label>Прозрачност
+          <div class="range-line"><input id="opacity" type="range" min="15" max="100" value="78"><span id="opacity-value">78%</span></div>
+        </label>
+      </div>
+      <label class="switch-line"><input id="auto-load" type="checkbox" checked><span>Автоматично зареждане на видимите общини при zoom 13+</span></label>
+    </section>
+  </aside>
+
+  <div id="map-toolbar" class="panel toolbar">
+    <button class="active" data-tool="pan" title="Преместване">✥</button>
+    <button data-tool="box" title="Правоъгълна селекция">▧</button>
+    <button id="select-visible" title="Избери клетките във видимия обхват">⊞</button>
+    <span class="divider"></span>
+    <button id="zoom-in" title="Приближаване">＋</button>
+    <button id="zoom-out" title="Отдалечаване">−</button>
+    <button id="fullscreen" title="Цял екран">⛶</button>
+  </div>
+
+  <aside id="csv-panel" class="panel csv-panel">
+    <header class="csv-header">
+      <div>
+        <span class="eyebrow">CSV генератор</span>
+        <h2>EIT_FixedNetCoverage.csv</h2>
+      </div>
+      <button id="csv-collapse" class="icon-button" title="Свий панела">›</button>
+    </header>
+    <div id="csv-content">
+      <section class="selection-banner">
+        <div><strong id="selected-count">0</strong><span>избрани GridCode клетки</span></div>
+        <button id="clear-selection">Изчисти</button>
+      </section>
+
+      <section class="section">
+        <div class="form-grid">
+          <label>TechnologyCode
+            <select id="technology"></select>
+          </label>
+          <label>VHCNClass
+            <select id="vhcn"></select>
+          </label>
+          <label>MaxUploadSpeed<select id="max-up" class="speed-select"></select></label>
+          <label>MaxDownloadSpeed<select id="max-down" class="speed-select"></select></label>
+          <label>ExpectedUploadPeakTimeSpeed<select id="peak-up" class="speed-select"></select></label>
+          <label>ExpectedDownloadPeakTimeSpeed<select id="peak-down" class="speed-select"></select></label>
+          <label>PotentialClientCount<input id="potential" type="number" min="0" step="1" value="0"></label>
+          <label>ServedAddressCount<input id="served" type="number" min="0" step="1" value="0"></label>
+        </div>
+        <button id="add-csv" class="primary wide">Добави избраните клетки в CSV</button>
+        <div id="form-status" class="status"></div>
+      </section>
+
+      <section class="section csv-preview-section">
+        <div class="section-title-row">
+          <div><span class="eyebrow">Работен набор</span><h2><span id="csv-count">0</span> реда</h2></div>
+          <button id="clear-csv" class="text-danger">Изчисти</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>GridCode</th><th>Слой</th><th>Tech</th><th>Down</th><th></th></tr></thead>
+            <tbody id="csv-table-body"><tr><td colspan="5" class="muted">Няма подготвени редове.</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section export-grid">
+        <label class="file-button">Импортирай CSV<input id="csv-import" type="file" accept=".csv,text/csv"></label>
+        <button id="download-csv" class="primary">Изтегли CSV</button>
+        <a class="secondary-link" href="EIT_FixedNetCoverage_template.csv" download>Празен шаблон</a>
+        <a class="secondary-link" href="docs/Requirements_FixedNet.pdf" target="_blank" rel="noopener">Инструкция PDF</a>
+        <p>UTF-8 · разделител „;“ · уникална комбинация GridCode + TechnologyCode</p>
+      </section>
+    </div>
+  </aside>
+
+  <div id="cell-popup" class="panel cell-popup"></div>
+  <div id="coordinates" class="panel coordinates">—</div>
+  <div id="attribution" class="attribution"></div>
+  <div id="loading-indicator" class="loading-indicator"><span></span><b id="loading-label">Зареждане…</b></div>
+  <div id="toast" role="status"></div>
+
+  <dialog id="help-dialog">
+    <div class="dialog-head"><h2>Работа с проекта</h2><button id="help-close" class="icon-button">×</button></div>
+    <div class="dialog-body">
+      <h3>Карта</h3>
+      <p>При общ изглед се използва лек национален обзор. От zoom 13 нагоре видимите общини се зареждат автоматично като отделни бинарни слоеве. Нито един файл не съдържа цялата национална геометрия.</p>
+      <h3>Избор на GridCode</h3>
+      <p>Кликнете върху клетка, използвайте правоъгълната селекция или бутона ⊞ за видимия обхват. Ctrl/Cmd + клик добавя клетка към текущата селекция.</p>
+      <h3>CSV</h3>
+      <p>Попълнете задължителните параметри и добавете избраните клетки. Работният набор се пази локално в браузъра чрез IndexedDB и не се изпраща към сървър.</p>
+      <h3>Хостинг</h3>
+      <p>Проектът е изцяло статичен. Копирайте съдържанието му в <code>public_html</code> или в поддиректория. Не са необходими PHP, Python или база данни.</p>
+    </div>
+  </dialog>
+</div>
+<script src="assets/app.js%3Fv=2.0.0"></script>
+</body>
+</html>
